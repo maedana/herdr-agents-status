@@ -1,0 +1,29 @@
+[package]
+name = "herdr-agents-status"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "herdr-agents-status"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.30"
+egui = "0.30"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+font-kit = "0.14"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11-dl = "2"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

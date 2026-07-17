@@ -1,0 +1,15 @@
+id = "maedana.agents-status"
+name = "Agents Status"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Always-on-top agent status overlay"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["cargo", "build", "--release"]
+
+[[actions]]
+id = "toggle"
+title = "Toggle Agents Status Overlay"
+contexts = ["global"]
+command = ["sh", "-c", "${HERDR_PLUGIN_ROOT}/target/release/herdr-agents-status &"]
