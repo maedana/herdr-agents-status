@@ -84,7 +84,39 @@ fn load_config() -> Config {
     toml::from_str(&content).unwrap_or_default()
 }
 
+fn pid_file_path() -> std::path::PathBuf {
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+        .unwrap_or_else(|_| format!("/tmp/herdr-agents-status-{}", unsafe { libc::getuid() }));
+    std::path::Path::new(&runtime_dir).join("herdr-agents-status.pid")
+}
+
+fn toggle_or_start() -> bool {
+    let pid_path = pid_file_path();
+    if let Ok(content) = std::fs::read_to_string(&pid_path) {
+        if let Ok(pid) = content.trim().parse::<i32>() {
+            unsafe {
+                if libc::kill(pid, 0) == 0 {
+                    libc::kill(pid, libc::SIGTERM);
+                    let _ = std::fs::remove_file(&pid_path);
+                    return false;
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&pid_path);
+    }
+    let _ = std::fs::write(&pid_path, std::process::id().to_string());
+    true
+}
+
+fn cleanup_pid_file() {
+    let _ = std::fs::remove_file(pid_file_path());
+}
+
 fn main() -> eframe::Result<()> {
+    if !toggle_or_start() {
+        return Ok(());
+    }
+
     let config = load_config();
     let state: Arc<Mutex<HerdrState>> = Arc::new(Mutex::new(HerdrState::default()));
     herdr::start_polling(Arc::clone(&state));
@@ -103,7 +135,7 @@ fn main() -> eframe::Result<()> {
 
     restore_focus_on_x11();
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "herdr-agents-status",
         options,
         Box::new(|cc| {
@@ -129,7 +161,10 @@ fn main() -> eframe::Result<()> {
                 hover_opacity: 1.0,
             }))
         }),
-    )
+    );
+
+    cleanup_pid_file();
+    result
 }
 
 fn restore_focus_on_x11() {
