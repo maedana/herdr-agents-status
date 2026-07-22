@@ -341,7 +341,9 @@ impl eframe::App for App {
             Err(_) => return,
         };
 
-        if agents.iter().any(|a| a.status == AgentStatus::Working) {
+        let has_pulse = agents.iter().any(|a| should_pulse(&a.status));
+
+        if has_pulse || agents.iter().any(|a| a.status == AgentStatus::Working) {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         } else if !agents.is_empty() {
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
@@ -395,6 +397,7 @@ impl eframe::App for App {
         }
 
         let hover_opacity = self.hover_opacity;
+        let time = ctx.input(|i| i.time);
 
         egui::CentralPanel::default()
             .frame(
@@ -411,18 +414,33 @@ impl eframe::App for App {
                     );
                 } else {
                     for agent in &agents {
-                        render_agent_row(ui, agent, hover_opacity);
+                        render_agent_row(ui, agent, time, hover_opacity);
                     }
                 }
             });
     }
 }
 
-fn render_agent_row(ui: &mut Ui, agent: &herdr::AgentInfo, hover_opacity: f32) {
+fn should_pulse(status: &AgentStatus) -> bool {
+    matches!(status, AgentStatus::Blocked | AgentStatus::Done)
+}
+
+fn calc_stroke_width(time: f64, pulse: bool) -> f32 {
+    if pulse {
+        let p = ((time * 16.0).sin() as f32 + 1.0) / 2.0;
+        1.0 + p * 2.0
+    } else {
+        1.0
+    }
+}
+
+fn render_agent_row(ui: &mut Ui, agent: &herdr::AgentInfo, time: f64, hover_opacity: f32) {
     let color = apply_opacity(status_color(&agent.status), hover_opacity);
     let body_color = apply_opacity(ROBOT_BODY_COLOR, hover_opacity);
     let fill = apply_opacity(bubble_fill_color(), hover_opacity);
     let label = format_label(agent);
+    let pulse = should_pulse(&agent.status);
+    let stroke_width = calc_stroke_width(time, pulse);
 
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
@@ -430,7 +448,7 @@ fn render_agent_row(ui: &mut Ui, agent: &herdr::AgentInfo, hover_opacity: f32) {
         ui.add_space(2.0);
 
         let max_label_width = (ui.available_width() - 14.0).max(0.0);
-        render_speech_bubble(ui, 1.0, color, fill, Some(max_label_width), |ui| {
+        render_speech_bubble(ui, stroke_width, color, fill, Some(max_label_width), |ui| {
             ui.label(RichText::new(label).color(color).size(11.0));
         });
     });
@@ -451,6 +469,56 @@ fn render_robot_art(ui: &mut Ui, state_color: Color32, body_color: Color32) {
             }
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_pulse_blocked() {
+        assert!(should_pulse(&AgentStatus::Blocked));
+    }
+
+    #[test]
+    fn should_pulse_done() {
+        assert!(should_pulse(&AgentStatus::Done));
+    }
+
+    #[test]
+    fn should_not_pulse_working() {
+        assert!(!should_pulse(&AgentStatus::Working));
+    }
+
+    #[test]
+    fn should_not_pulse_idle() {
+        assert!(!should_pulse(&AgentStatus::Idle));
+    }
+
+    #[test]
+    fn should_not_pulse_unknown() {
+        assert!(!should_pulse(&AgentStatus::Unknown));
+    }
+
+    #[test]
+    fn calc_stroke_width_no_pulse_is_always_one() {
+        assert_eq!(calc_stroke_width(0.0, false), 1.0);
+        assert_eq!(calc_stroke_width(5.0, false), 1.0);
+    }
+
+    #[test]
+    fn calc_stroke_width_pulse_oscillates() {
+        let mut saw_peak = false;
+        for t in 0..100 {
+            let time = t as f64 * 0.1;
+            let w = calc_stroke_width(time, true);
+            assert!(w >= 1.0 && w <= 3.0, "got {w} at time {time}");
+            if w > 2.5 {
+                saw_peak = true;
+            }
+        }
+        assert!(saw_peak, "should reach near 3.0");
+    }
 }
 
 fn render_speech_bubble(
