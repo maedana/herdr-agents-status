@@ -4,6 +4,10 @@ Always-on-top transparent overlay showing [Herdr](https://herdr.dev) agent statu
 
 Spiritual successor to [claudeye](https://github.com/maedana/claudeye), built for Herdr instead of tmux.
 
+![demo](docs/demo.gif)
+
+Agents waiting for you (`Blocked`) or finished (`Done`) hop up and down, so they stand out at a glance.
+
 ## Install
 
 ```bash
