@@ -13,6 +13,12 @@ const WINDOW_PADDING: f32 = 8.0;
 const MARGIN: f32 = 2.0;
 const ROW_HORIZONTAL_OVERHEAD: f32 = 82.0;
 const ROBOT_BODY_COLOR: Color32 = Color32::from_rgb(210, 110, 30);
+const ROBOT_WIDTH: f32 = 40.0;
+const ROBOT_LINE_SIZE: f32 = 5.0;
+const BOUNCE_HZ: f32 = 1.6;
+const BOUNCE_HEIGHT: f32 = 3.0;
+const HEAD_LAG_PHASE: f32 = 0.12;
+const HEAD_LAG_AMPLITUDE: f32 = 1.5;
 const HOVER_OPACITY: f32 = 0.0;
 const HOVER_LERP_FACTOR: f32 = 0.25;
 const OPACITY_SNAP_THRESHOLD: f32 = 0.01;
@@ -343,7 +349,10 @@ impl eframe::App for App {
 
         let has_pulse = agents.iter().any(|a| should_pulse(&a.status));
 
-        if has_pulse || agents.iter().any(|a| a.status == AgentStatus::Working) {
+        if agents.iter().any(|a| should_bounce(&a.status)) {
+            // 跳ねるアニメーションは滑らかに動かす必要がある
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        } else if has_pulse || agents.iter().any(|a| a.status == AgentStatus::Working) {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         } else if !agents.is_empty() {
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
@@ -425,6 +434,27 @@ fn should_pulse(status: &AgentStatus) -> bool {
     matches!(status, AgentStatus::Blocked | AgentStatus::Done)
 }
 
+fn should_bounce(status: &AgentStatus) -> bool {
+    matches!(status, AgentStatus::Blocked | AgentStatus::Done)
+}
+
+/// Blocked / Done のときにキャラを跳ねさせる。戻り値は (体のYオフセット, 頭に足す追加Yオフセット)。
+/// 頭は体よりワンテンポ遅れて追従するので、上昇中は下に、下降中は上に残る。
+#[allow(clippy::cast_possible_truncation)]
+fn bounce_offsets(time: f64, animate: bool) -> (f32, f32) {
+    if !animate {
+        return (0.0, 0.0);
+    }
+    let phase = (time * f64::from(BOUNCE_HZ)).rem_euclid(1.0);
+    let height = (phase * std::f64::consts::PI).sin().abs();
+    let lagged = ((phase - f64::from(HEAD_LAG_PHASE)) * std::f64::consts::PI)
+        .sin()
+        .abs();
+    let body = -BOUNCE_HEIGHT * height as f32;
+    let head = -HEAD_LAG_AMPLITUDE * (lagged - height) as f32;
+    (body, head)
+}
+
 fn calc_stroke_width(time: f64, pulse: bool) -> f32 {
     if pulse {
         let p = ((time * 16.0).sin() as f32 + 1.0) / 2.0;
@@ -441,10 +471,11 @@ fn render_agent_row(ui: &mut Ui, agent: &herdr::AgentInfo, time: f64, hover_opac
     let label = format_label(agent);
     let pulse = should_pulse(&agent.status);
     let stroke_width = calc_stroke_width(time, pulse);
+    let offsets = bounce_offsets(time, should_bounce(&agent.status));
 
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
-        render_robot_art(ui, color, body_color);
+        render_robot_art(ui, color, body_color, offsets);
         ui.add_space(2.0);
 
         let max_label_width = (ui.available_width() - 14.0).max(0.0);
@@ -454,21 +485,30 @@ fn render_agent_row(ui: &mut Ui, agent: &herdr::AgentInfo, time: f64, hover_opac
     });
 }
 
-fn render_robot_art(ui: &mut Ui, state_color: Color32, body_color: Color32) {
-    ui.allocate_ui(Vec2::new(40.0, ROW_HEIGHT), |ui| {
-        ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-            ui.spacing_mut().item_spacing.y = 0.0;
-            let lines: [(&str, Color32); 4] = [
-                ("▟█▙", state_color),
-                ("▐▛███▜▌", body_color),
-                ("▝▜█████▛▘", body_color),
-                ("▘▘ ▝▝", body_color),
-            ];
-            for (text, color) in lines {
-                ui.label(RichText::new(text).size(5.0).color(color).monospace());
-            }
-        });
-    });
+fn render_robot_art(ui: &mut Ui, state_color: Color32, body_color: Color32, offsets: (f32, f32)) {
+    let (body_dy, head_dy) = offsets;
+    let (rect, _) =
+        ui.allocate_exact_size(Vec2::new(ROBOT_WIDTH, ROW_HEIGHT), egui::Sense::hover());
+
+    let lines: [(&str, Color32); 4] = [
+        ("▟█▙", state_color),
+        ("▐▛███▜▌", body_color),
+        ("▝▜█████▛▘", body_color),
+        ("▘▘ ▝▝", body_color),
+    ];
+
+    let mut y = rect.top();
+    for (i, (text, color)) in lines.into_iter().enumerate() {
+        let galley = ui.painter().layout_no_wrap(
+            text.to_owned(),
+            egui::FontId::monospace(ROBOT_LINE_SIZE),
+            color,
+        );
+        let dy = body_dy + if i == 0 { head_dy } else { 0.0 };
+        let pos = egui::pos2(rect.center().x - galley.size().x / 2.0, y + dy);
+        y += galley.size().y;
+        ui.painter().galley(pos, galley, color);
+    }
 }
 
 #[cfg(test)]
@@ -498,6 +538,74 @@ mod tests {
     #[test]
     fn should_not_pulse_unknown() {
         assert!(!should_pulse(&AgentStatus::Unknown));
+    }
+
+    #[test]
+    fn should_bounce_when_blocked_or_done() {
+        assert!(should_bounce(&AgentStatus::Done));
+        assert!(should_bounce(&AgentStatus::Blocked));
+        assert!(!should_bounce(&AgentStatus::Working));
+        assert!(!should_bounce(&AgentStatus::Idle));
+        assert!(!should_bounce(&AgentStatus::Unknown));
+    }
+
+    #[test]
+    fn bounce_offsets_are_zero_when_not_animating() {
+        assert_eq!(bounce_offsets(0.0, false), (0.0, 0.0));
+        assert_eq!(bounce_offsets(1.234, false), (0.0, 0.0));
+    }
+
+    #[test]
+    fn bounce_offsets_start_grounded() {
+        let (body, _) = bounce_offsets(0.0, true);
+        assert!(body.abs() < 0.001, "got {body}");
+    }
+
+    #[test]
+    fn bounce_offsets_reach_peak_at_half_phase() {
+        let time = 0.5 / f64::from(BOUNCE_HZ);
+        let (body, _) = bounce_offsets(time, true);
+        assert!((body + BOUNCE_HEIGHT).abs() < 0.001, "got {body}");
+    }
+
+    #[test]
+    fn bounce_offsets_stay_within_range() {
+        for i in 0..500 {
+            let time = f64::from(i) * 0.017;
+            let (body, head) = bounce_offsets(time, true);
+            assert!(
+                (-BOUNCE_HEIGHT..=0.0).contains(&body),
+                "body {body} at {time}"
+            );
+            assert!(head.abs() <= HEAD_LAG_AMPLITUDE, "head {head} at {time}");
+        }
+    }
+
+    #[test]
+    fn head_lags_behind_body_while_rising() {
+        // 上昇中は頭が体より下に残る（= 正のオフセット）
+        let time = 0.25 / f64::from(BOUNCE_HZ);
+        let (_, head) = bounce_offsets(time, true);
+        assert!(head > 0.0, "got {head}");
+    }
+
+    #[test]
+    fn head_lags_behind_body_while_falling() {
+        // 下降中は頭が体より上に残る（= 負のオフセット）
+        let time = 0.75 / f64::from(BOUNCE_HZ);
+        let (_, head) = bounce_offsets(time, true);
+        assert!(head < 0.0, "got {head}");
+    }
+
+    #[test]
+    fn bounce_offsets_repeat_every_cycle() {
+        let period = 1.0 / f64::from(BOUNCE_HZ);
+        for i in 0..10 {
+            let t = f64::from(i) * 0.03;
+            let a = bounce_offsets(t, true);
+            let b = bounce_offsets(t + period, true);
+            assert!((a.0 - b.0).abs() < 0.001 && (a.1 - b.1).abs() < 0.001);
+        }
     }
 
     #[test]
