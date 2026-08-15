@@ -16,6 +16,18 @@ pub enum AgentStatus {
 }
 
 impl AgentStatus {
+    /// herdr の agent panel の "priority" (attention queue) と同じ考え方で、
+    /// 手が必要なものほど小さい値を返す。
+    pub fn priority(&self) -> u8 {
+        match self {
+            Self::Blocked => 0,
+            Self::Done => 1,
+            Self::Working => 2,
+            Self::Idle => 3,
+            Self::Unknown => 4,
+        }
+    }
+
     pub fn label(&self) -> &'static str {
         match self {
             Self::Idle => "Idle",
@@ -154,7 +166,18 @@ fn git_branch(cwd: &str) -> Option<String> {
     }
 }
 
+/// 手が必要なものを上に集める。同じステータス内は取得順（セッション順・ペイン順）のまま。
+fn sort_agents(agents: &mut [AgentInfo]) {
+    agents.sort_by_key(|a| a.status.priority());
+}
+
 fn fetch_agents(scope: SessionScope) -> Option<Vec<AgentInfo>> {
+    let mut agents = collect_agents(scope)?;
+    sort_agents(&mut agents);
+    Some(agents)
+}
+
+fn collect_agents(scope: SessionScope) -> Option<Vec<AgentInfo>> {
     if scope == SessionScope::Current {
         return fetch_session_agents(None);
     }
@@ -268,6 +291,56 @@ mod tests {
     fn parse_session_list_returns_empty_on_broken_json() {
         assert!(parse_session_list("not json").is_empty());
         assert!(parse_session_list("").is_empty());
+    }
+
+    fn agent(status: AgentStatus, name: &str) -> AgentInfo {
+        AgentInfo {
+            display_name: name.to_owned(),
+            status,
+            project_name: name.to_owned(),
+            git_branch: None,
+            terminal_title_stripped: None,
+        }
+    }
+
+    fn names(agents: &[AgentInfo]) -> Vec<&str> {
+        agents.iter().map(|a| a.project_name.as_str()).collect()
+    }
+
+    #[test]
+    fn attention_priority_orders_blocked_first_and_idle_last() {
+        assert!(AgentStatus::Blocked.priority() < AgentStatus::Done.priority());
+        assert!(AgentStatus::Done.priority() < AgentStatus::Working.priority());
+        assert!(AgentStatus::Working.priority() < AgentStatus::Idle.priority());
+        assert!(AgentStatus::Idle.priority() <= AgentStatus::Unknown.priority());
+    }
+
+    #[test]
+    fn sort_agents_puts_the_ones_needing_attention_on_top() {
+        let mut agents = vec![
+            agent(AgentStatus::Idle, "idle"),
+            agent(AgentStatus::Working, "working"),
+            agent(AgentStatus::Unknown, "unknown"),
+            agent(AgentStatus::Done, "done"),
+            agent(AgentStatus::Blocked, "blocked"),
+        ];
+        sort_agents(&mut agents);
+        assert_eq!(
+            names(&agents),
+            ["blocked", "done", "working", "idle", "unknown"]
+        );
+    }
+
+    #[test]
+    fn sort_agents_keeps_original_order_within_a_status() {
+        let mut agents = vec![
+            agent(AgentStatus::Working, "w1"),
+            agent(AgentStatus::Blocked, "b1"),
+            agent(AgentStatus::Working, "w2"),
+            agent(AgentStatus::Blocked, "b2"),
+        ];
+        sort_agents(&mut agents);
+        assert_eq!(names(&agents), ["b1", "b2", "w1", "w2"]);
     }
 
     #[test]

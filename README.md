@@ -7,6 +7,7 @@ Spiritual successor to [claudeye](https://github.com/maedana/claudeye), built fo
 ![demo](docs/demo.gif)
 
 Agents waiting for you (`Blocked`) or finished (`Done`) hop up and down, so they stand out at a glance.
+Rows are ordered like Herdr's `priority` agent panel — `Blocked`, `Done`, `Working`, then `Idle` — and idle agents are dimmed.
 
 ## Install
 

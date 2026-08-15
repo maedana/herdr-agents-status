@@ -19,6 +19,7 @@ const BOUNCE_HZ: f32 = 1.6;
 const BOUNCE_HEIGHT: f32 = 3.0;
 const HEAD_LAG_PHASE: f32 = 0.12;
 const HEAD_LAG_AMPLITUDE: f32 = 1.5;
+const IDLE_OPACITY: f32 = 0.4;
 const HOVER_OPACITY: f32 = 0.0;
 const HOVER_LERP_FACTOR: f32 = 0.25;
 const OPACITY_SNAP_THRESHOLD: f32 = 0.01;
@@ -240,6 +241,14 @@ fn status_color(status: &AgentStatus) -> Color32 {
         AgentStatus::Blocked => Color32::from_rgb(220, 180, 0),
         AgentStatus::Idle | AgentStatus::Unknown => Color32::from_gray(160),
         AgentStatus::Done => Color32::from_rgb(100, 180, 220),
+    }
+}
+
+/// 手が空いているエージェントは薄くして、注意が必要な行を目立たせる。
+fn status_opacity(status: &AgentStatus) -> f32 {
+    match status {
+        AgentStatus::Idle | AgentStatus::Unknown => IDLE_OPACITY,
+        _ => 1.0,
     }
 }
 
@@ -466,9 +475,10 @@ fn calc_stroke_width(time: f64, pulse: bool) -> f32 {
 }
 
 fn render_agent_row(ui: &mut Ui, agent: &herdr::AgentInfo, time: f64, hover_opacity: f32) {
-    let color = apply_opacity(status_color(&agent.status), hover_opacity);
-    let body_color = apply_opacity(ROBOT_BODY_COLOR, hover_opacity);
-    let fill = apply_opacity(bubble_fill_color(), hover_opacity);
+    let opacity = hover_opacity * status_opacity(&agent.status);
+    let color = apply_opacity(status_color(&agent.status), opacity);
+    let body_color = apply_opacity(ROBOT_BODY_COLOR, opacity);
+    let fill = apply_opacity(bubble_fill_color(), opacity);
     let label = format_label(agent);
     let pulse = should_pulse(&agent.status);
     let stroke_width = calc_stroke_width(time, pulse);
@@ -539,6 +549,23 @@ mod tests {
     #[test]
     fn should_not_pulse_unknown() {
         assert!(!should_pulse(&AgentStatus::Unknown));
+    }
+
+    #[test]
+    fn idle_agents_are_dimmed() {
+        assert!((status_opacity(&AgentStatus::Idle) - IDLE_OPACITY).abs() < f32::EPSILON);
+        assert!((status_opacity(&AgentStatus::Unknown) - IDLE_OPACITY).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn agents_needing_attention_stay_fully_opaque() {
+        for status in [
+            AgentStatus::Blocked,
+            AgentStatus::Done,
+            AgentStatus::Working,
+        ] {
+            assert!((status_opacity(&status) - 1.0).abs() < f32::EPSILON);
+        }
     }
 
     #[test]
