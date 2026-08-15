@@ -49,10 +49,18 @@ Create `~/.config/herdr/plugins/config/maedana.agents-status/config.toml`:
 
 ```toml
 position = "top-right"
+sessions = "all"
 ```
 
-Available positions:
+### `position`
 
 - `top-left`, `top-center` (default), `top-right`
 - `middle-left`, `middle-center`, `middle-right`
 - `bottom-left`, `bottom-center`, `bottom-right`
+
+### `sessions`
+
+Which Herdr sessions to show agents from:
+
+- `all` (default) — every running session, merged into one list
+- `current` — only the session the overlay was launched from

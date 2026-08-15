@@ -67,8 +67,61 @@ struct RawAgentInfo {
     terminal_title_stripped: Option<String>,
 }
 
+/// どのセッションのエージェントを表示するか。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionScope {
+    /// running な全セッションをまとめて表示する
+    #[default]
+    All,
+    /// オーバーレイを起動したセッションだけを表示する
+    Current,
+}
+
+#[derive(Deserialize)]
+struct SessionListResponse {
+    sessions: Vec<SessionEntry>,
+}
+
+#[derive(Deserialize)]
+struct SessionEntry {
+    name: String,
+    #[serde(default)]
+    running: bool,
+}
+
 fn herdr_bin() -> String {
     std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".into())
+}
+
+fn parse_session_list(json: &str) -> Vec<String> {
+    serde_json::from_str::<SessionListResponse>(json)
+        .map(|r| {
+            r.sessions
+                .into_iter()
+                .filter(|s| s.running)
+                .map(|s| s.name)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `session` を指定しないときは環境変数 (`HERDR_SESSION`) が指すセッションに繋がる。
+fn agent_list_args(session: Option<&str>) -> Vec<&str> {
+    match session {
+        Some(name) => vec!["--session", name, "agent", "list"],
+        None => vec!["agent", "list"],
+    }
+}
+
+fn running_sessions() -> Vec<String> {
+    Command::new(herdr_bin())
+        .args(["session", "list", "--json"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| parse_session_list(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_default()
 }
 
 fn parse_status(s: &str) -> AgentStatus {
@@ -101,10 +154,32 @@ fn git_branch(cwd: &str) -> Option<String> {
     }
 }
 
-fn fetch_agents() -> Option<Vec<AgentInfo>> {
+fn fetch_agents(scope: SessionScope) -> Option<Vec<AgentInfo>> {
+    if scope == SessionScope::Current {
+        return fetch_session_agents(None);
+    }
+
+    let sessions = running_sessions();
+    if sessions.is_empty() {
+        // セッション一覧が取れないときは起動元セッションだけにフォールバックする
+        return fetch_session_agents(None);
+    }
+
+    let mut agents = Vec::new();
+    let mut reached_any = false;
+    for name in &sessions {
+        if let Some(mut found) = fetch_session_agents(Some(name)) {
+            reached_any = true;
+            agents.append(&mut found);
+        }
+    }
+    reached_any.then_some(agents)
+}
+
+fn fetch_session_agents(session: Option<&str>) -> Option<Vec<AgentInfo>> {
     let herdr = herdr_bin();
     let output = Command::new(&herdr)
-        .args(["agent", "list"])
+        .args(agent_list_args(session))
         .output()
         .ok()?;
     if !output.status.success() {
@@ -139,9 +214,9 @@ fn fetch_agents() -> Option<Vec<AgentInfo>> {
     }
 }
 
-pub fn start_polling(state: Arc<Mutex<HerdrState>>) {
+pub fn start_polling(state: Arc<Mutex<HerdrState>>, scope: SessionScope) {
     std::thread::spawn(move || loop {
-        if let Some(agents) = fetch_agents() {
+        if let Some(agents) = fetch_agents(scope) {
             if let Ok(mut s) = state.lock() {
                 s.agents = agents;
             }
@@ -167,5 +242,44 @@ mod tests {
     fn project_name_extracts_basename() {
         assert_eq!(project_name("/home/user/herdr"), "herdr");
         assert_eq!(project_name("/"), "?");
+    }
+
+    #[test]
+    fn parse_session_list_returns_running_names() {
+        let json = r#"{"sessions":[
+            {"default":true,"name":"default","running":true,
+             "session_dir":"/x","socket_path":"/x/herdr.sock"},
+            {"default":false,"name":"private","running":true,
+             "session_dir":"/y","socket_path":"/y/herdr.sock"}
+        ]}"#;
+        assert_eq!(parse_session_list(json), vec!["default", "private"]);
+    }
+
+    #[test]
+    fn parse_session_list_skips_stopped_sessions() {
+        let json = r#"{"sessions":[
+            {"name":"default","running":true},
+            {"name":"stopped","running":false}
+        ]}"#;
+        assert_eq!(parse_session_list(json), vec!["default"]);
+    }
+
+    #[test]
+    fn parse_session_list_returns_empty_on_broken_json() {
+        assert!(parse_session_list("not json").is_empty());
+        assert!(parse_session_list("").is_empty());
+    }
+
+    #[test]
+    fn agent_list_args_without_session() {
+        assert_eq!(agent_list_args(None), vec!["agent", "list"]);
+    }
+
+    #[test]
+    fn agent_list_args_with_session() {
+        assert_eq!(
+            agent_list_args(Some("private")),
+            vec!["--session", "private", "agent", "list"]
+        );
     }
 }

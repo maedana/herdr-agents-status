@@ -3,7 +3,7 @@ mod herdr;
 use eframe::egui::{self, Color32, RichText, Ui, Vec2};
 use std::sync::{Arc, Mutex};
 
-use herdr::{AgentStatus, HerdrState};
+use herdr::{AgentStatus, HerdrState, SessionScope};
 
 const REPAINT_INTERVAL_SECS: u64 = 2;
 const MIN_WINDOW_WIDTH: f32 = 180.0;
@@ -66,6 +66,7 @@ impl Position {
 #[serde(default)]
 struct Config {
     position: Position,
+    sessions: SessionScope,
 }
 
 fn load_config() -> Config {
@@ -125,7 +126,7 @@ fn main() -> eframe::Result<()> {
 
     let config = load_config();
     let state: Arc<Mutex<HerdrState>> = Arc::new(Mutex::new(HerdrState::default()));
-    herdr::start_polling(Arc::clone(&state));
+    herdr::start_polling(Arc::clone(&state), config.sessions);
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -538,6 +539,28 @@ mod tests {
     #[test]
     fn should_not_pulse_unknown() {
         assert!(!should_pulse(&AgentStatus::Unknown));
+    }
+
+    #[test]
+    fn config_shows_all_sessions_by_default() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.sessions, SessionScope::All);
+    }
+
+    #[test]
+    fn config_parses_sessions_setting() {
+        let config: Config = toml::from_str(r#"sessions = "current""#).unwrap();
+        assert_eq!(config.sessions, SessionScope::Current);
+        let config: Config = toml::from_str(r#"sessions = "all""#).unwrap();
+        assert_eq!(config.sessions, SessionScope::All);
+    }
+
+    #[test]
+    fn config_keeps_position_alongside_sessions() {
+        let config: Config =
+            toml::from_str("position = \"top-right\"\nsessions = \"current\"").unwrap();
+        assert!(matches!(config.position, Position::TopRight));
+        assert_eq!(config.sessions, SessionScope::Current);
     }
 
     #[test]
