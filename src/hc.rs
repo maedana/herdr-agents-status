@@ -23,13 +23,39 @@ struct LsResponse {
     terminals: Vec<HcTerminal>,
 }
 
-/// `hc get <address> --json` の title / name。
+/// `hc get <address> --json` の title / name と、見たかどうかの判定に使う turn / labels。
 #[derive(Debug, Default, PartialEq, Eq, Deserialize)]
 struct GetResponse {
     #[serde(default)]
     title: Option<String>,
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    turn: u64,
+    #[serde(default)]
+    labels: Labels,
+}
+
+#[derive(Debug, Default, PartialEq, Eq, Deserialize)]
+struct Labels {
+    /// herdr-app が「見た」ときの turn を書き込むラベル
+    #[serde(rename = "herdr.seen", default)]
+    seen: Option<String>,
+}
+
+impl GetResponse {
+    fn seen(&self) -> Option<u64> {
+        self.labels.seen.as_deref()?.parse().ok()
+    }
+}
+
+/// herdr-core の status は Done のまま変わらない。herdr-app は誰かが見たら（`herdr.seen` がその turn に追いついたら）
+/// Idle として扱うので、それに合わせる（`herdr.d.ts` の AgentInfo.status: "done ... becomes idle once you look"）。
+fn effective_status(status: &str, turn: u64, seen: Option<u64>) -> &str {
+    match seen {
+        Some(seen) if status == "done" && seen >= turn => "idle",
+        _ => status,
+    }
 }
 
 /// `status` を持たない terminal（ただのシェルなど）は agent ではないので捨てる。
@@ -73,16 +99,17 @@ pub fn fetch_core_agents() -> Option<Vec<AgentInfo>> {
 }
 
 fn fetch_core_agent(t: &HcTerminal) -> AgentInfo {
-    let GetResponse { title, name } = hc_output(&["get", &t.address, "--json"])
+    let get = hc_output(&["get", &t.address, "--json"])
         .map(|json| parse_hc_get(&json))
         .unwrap_or_default();
+    let status = effective_status(t.status.as_deref().unwrap_or_default(), get.turn, get.seen());
     AgentInfo::new(
-        name,
+        get.name,
         t.agent.clone(),
         &t.address,
-        t.status.as_deref().unwrap_or_default(),
+        status,
         t.cwd.as_deref(),
-        title,
+        get.title,
     )
 }
 
@@ -146,7 +173,7 @@ mod tests {
         let json = r#"{"address":"t4","name":null,"title":"t"}"#;
         assert_eq!(
             parse_hc_get(json),
-            GetResponse { title: Some("t".into()), name: None }
+            GetResponse { title: Some("t".into()), ..GetResponse::default() }
         );
     }
 
@@ -154,5 +181,39 @@ mod tests {
     fn parse_hc_get_returns_default_for_empty_or_broken_json() {
         assert_eq!(parse_hc_get(""), GetResponse::default());
         assert_eq!(parse_hc_get("not json"), GetResponse::default());
+    }
+
+    #[test]
+    fn parse_hc_get_reads_turn_and_seen_label() {
+        let json = r#"{"address":"t4","turn":27,"labels":{"herdr.seen":"27","where":"~ / 1"}}"#;
+        let got = parse_hc_get(json);
+        assert_eq!(got.turn, 27);
+        assert_eq!(got.seen(), Some(27));
+    }
+
+    #[test]
+    fn parse_hc_get_without_seen_label() {
+        let got = parse_hc_get(r#"{"address":"t4","turn":3,"labels":{}}"#);
+        assert_eq!(got.seen(), None);
+        assert_eq!(parse_hc_get(r#"{"address":"t4"}"#).seen(), None);
+    }
+
+    // herdr-app と同じく、Done は誰かが見た（herdr.seen がその turn に追いついた）ら Idle 扱い
+    #[test]
+    fn done_that_was_seen_is_idle() {
+        assert_eq!(effective_status("done", 27, Some(27)), "idle");
+        assert_eq!(effective_status("done", 27, Some(28)), "idle");
+    }
+
+    #[test]
+    fn done_not_yet_seen_stays_done() {
+        assert_eq!(effective_status("done", 16, Some(15)), "done");
+        assert_eq!(effective_status("done", 16, None), "done");
+    }
+
+    #[test]
+    fn other_statuses_ignore_seen() {
+        assert_eq!(effective_status("working", 5, Some(5)), "working");
+        assert_eq!(effective_status("blocked", 5, Some(5)), "blocked");
     }
 }
