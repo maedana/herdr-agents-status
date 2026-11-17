@@ -1,6 +1,8 @@
+mod hc;
 mod herdr;
 
 use eframe::egui::{self, Color32, RichText, Ui, Vec2};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use herdr::{AgentStatus, HerdrState, SessionScope};
@@ -70,7 +72,40 @@ struct Config {
     sessions: SessionScope,
 }
 
-fn load_config() -> Config {
+/// 引数（argv[0] を除く）から `--config <path>` / `--config=<path>` を取り出す。
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<PathBuf>, String> {
+    let mut args = args.into_iter();
+    let mut config_path = None;
+    while let Some(arg) = args.next() {
+        let value = if arg == "--config" {
+            args.next()
+        } else if let Some(value) = arg.strip_prefix("--config=") {
+            Some(value.to_owned())
+        } else {
+            return Err(format!("不明な引数です: {arg}"));
+        };
+        match value.filter(|v| !v.is_empty()) {
+            Some(value) => config_path = Some(PathBuf::from(value)),
+            None => return Err("--config にはファイルパスが必要です".to_owned()),
+        }
+    }
+    Ok(config_path)
+}
+
+fn parse_config(content: &str) -> Result<Config, String> {
+    toml::from_str(content).map_err(|e| e.to_string())
+}
+
+/// 明示された設定ファイルを読む。読めない・TOML が不正ならパスと理由つきの Err。
+fn load_config_file(path: &Path) -> Result<Config, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("設定ファイルを読めません: {}: {e}", path.display()))?;
+    parse_config(&content)
+        .map_err(|e| format!("設定ファイルが不正です: {}: {e}", path.display()))
+}
+
+/// herdr プラグインの設定ディレクトリの config.toml を読む。無い・壊れていれば既定値。
+fn load_default_config() -> Config {
     let config_dir = std::process::Command::new(
         std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".into()),
     )
@@ -84,12 +119,19 @@ fn load_config() -> Config {
         return Config::default();
     };
 
-    let path = std::path::Path::new(&dir).join("config.toml");
+    let path = Path::new(&dir).join("config.toml");
     let Ok(content) = std::fs::read_to_string(&path) else {
         return Config::default();
     };
 
-    toml::from_str(&content).unwrap_or_default()
+    parse_config(&content).unwrap_or_default()
+}
+
+fn load_config(explicit: Option<&Path>) -> Result<Config, String> {
+    match explicit {
+        Some(path) => load_config_file(path),
+        None => Ok(load_default_config()),
+    }
 }
 
 fn pid_file_path() -> std::path::PathBuf {
@@ -121,11 +163,27 @@ fn cleanup_pid_file() {
 }
 
 fn main() -> eframe::Result<()> {
+    // 引数が不正なときは pid ファイルに触れる前に終了する
+    let config_path = match parse_args(std::env::args().skip(1)) {
+        Ok(path) => path,
+        Err(message) => {
+            eprintln!("herdr-agents-status: {message}");
+            std::process::exit(2);
+        }
+    };
+
     if !toggle_or_start() {
         return Ok(());
     }
 
-    let config = load_config();
+    let config = match load_config(config_path.as_deref()) {
+        Ok(config) => config,
+        Err(message) => {
+            eprintln!("herdr-agents-status: {message}");
+            cleanup_pid_file();
+            std::process::exit(2);
+        }
+    };
     let state: Arc<Mutex<HerdrState>> = Arc::new(Mutex::new(HerdrState::default()));
     herdr::start_polling(Arc::clone(&state), config.sessions);
 
@@ -580,6 +638,92 @@ mod tests {
         assert_eq!(config.sessions, SessionScope::Current);
         let config: Config = toml::from_str(r#"sessions = "all""#).unwrap();
         assert_eq!(config.sessions, SessionScope::All);
+    }
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn parse_args_without_arguments_has_no_config_path() {
+        assert_eq!(parse_args(args(&[])), Ok(None));
+    }
+
+    #[test]
+    fn parse_args_accepts_config_with_separate_value() {
+        assert_eq!(
+            parse_args(args(&["--config", "/tmp/a.toml"])),
+            Ok(Some(PathBuf::from("/tmp/a.toml")))
+        );
+    }
+
+    #[test]
+    fn parse_args_accepts_config_with_equals() {
+        assert_eq!(
+            parse_args(args(&["--config=/tmp/b.toml"])),
+            Ok(Some(PathBuf::from("/tmp/b.toml")))
+        );
+    }
+
+    #[test]
+    fn parse_args_rejects_config_without_value() {
+        let err = parse_args(args(&["--config"])).unwrap_err();
+        assert!(err.contains("--config"), "got {err}");
+        assert!(parse_args(args(&["--config="])).is_err());
+    }
+
+    #[test]
+    fn parse_args_rejects_unknown_arguments() {
+        let err = parse_args(args(&["--bogus"])).unwrap_err();
+        assert!(err.contains("--bogus"), "got {err}");
+        assert!(parse_args(args(&["positional"])).is_err());
+        assert!(parse_args(args(&["--config", "a.toml", "extra"])).is_err());
+    }
+
+    #[test]
+    fn parse_config_parses_valid_toml() {
+        let config = parse_config("position = \"top-right\"\nsessions = \"current\"").unwrap();
+        assert!(matches!(config.position, Position::TopRight));
+        assert_eq!(config.sessions, SessionScope::Current);
+    }
+
+    #[test]
+    fn parse_config_rejects_invalid_toml() {
+        assert!(parse_config("position = ").is_err());
+        assert!(parse_config("position = \"nowhere\"").is_err());
+    }
+
+    fn temp_config_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "herdr-agents-status-test-{}-{tag}.toml",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn load_config_file_reads_the_given_file() {
+        let path = temp_config_path("ok");
+        std::fs::write(&path, "position = \"bottom-left\"\n").unwrap();
+        let config = load_config_file(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(config.position, Position::BottomLeft));
+    }
+
+    #[test]
+    fn load_config_file_reports_path_when_unreadable() {
+        let path = temp_config_path("missing");
+        let _ = std::fs::remove_file(&path);
+        let err = load_config_file(&path).unwrap_err();
+        assert!(err.contains(&path.display().to_string()), "got {err}");
+    }
+
+    #[test]
+    fn load_config_file_reports_path_when_toml_is_invalid() {
+        let path = temp_config_path("broken");
+        std::fs::write(&path, "position = ").unwrap();
+        let err = load_config_file(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert!(err.contains(&path.display().to_string()), "got {err}");
     }
 
     #[test]

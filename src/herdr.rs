@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::hc;
+
 const POLL_INTERVAL_SECS: u64 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +48,46 @@ pub struct AgentInfo {
     pub project_name: String,
     pub git_branch: Option<String>,
     pub terminal_title_stripped: Option<String>,
+}
+
+impl AgentInfo {
+    /// 各バックエンド共通の組み立て。表示名は name → agent → id の順にフォールバックし、
+    /// 空の name / title は無いものとして扱う。`git_branch` は cwd から git を呼んで取る。
+    pub(crate) fn new(
+        name: Option<String>,
+        agent: Option<String>,
+        id: &str,
+        status: &str,
+        cwd: Option<&str>,
+        title: Option<String>,
+    ) -> Self {
+        let mut info = Self::without_branch(name, agent, id, status, cwd, title);
+        info.git_branch = cwd.and_then(git_branch);
+        info
+    }
+
+    /// `new` から git 呼び出しを除いた純粋な部分。
+    fn without_branch(
+        name: Option<String>,
+        agent: Option<String>,
+        id: &str,
+        status: &str,
+        cwd: Option<&str>,
+        title: Option<String>,
+    ) -> Self {
+        let display_name = name
+            .into_iter()
+            .chain(agent)
+            .find(|n| !n.is_empty())
+            .unwrap_or_else(|| id.to_owned());
+        Self {
+            display_name,
+            status: parse_status(status),
+            project_name: cwd.map_or_else(|| "?".into(), project_name),
+            git_branch: None,
+            terminal_title_stripped: title.filter(|t| !t.is_empty()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -171,10 +213,23 @@ fn sort_agents(agents: &mut [AgentInfo]) {
     agents.sort_by_key(|a| a.status.priority());
 }
 
-fn fetch_agents(scope: SessionScope) -> Option<Vec<AgentInfo>> {
-    let mut agents = collect_agents(scope)?;
+/// herdr と herdr-core の結果を合わせて並べ替える。
+/// 両方取れなかったときだけ None（前回の表示を保つ）。片方だけ取れたならそれだけ表示する。
+fn merge(
+    herdr: Option<Vec<AgentInfo>>,
+    core: Option<Vec<AgentInfo>>,
+) -> Option<Vec<AgentInfo>> {
+    if herdr.is_none() && core.is_none() {
+        return None;
+    }
+    let mut agents = herdr.unwrap_or_default();
+    agents.extend(core.unwrap_or_default());
     sort_agents(&mut agents);
     Some(agents)
+}
+
+fn fetch_agents(scope: SessionScope) -> Option<Vec<AgentInfo>> {
+    merge(collect_agents(scope), hc::fetch_core_agents())
 }
 
 fn collect_agents(scope: SessionScope) -> Option<Vec<AgentInfo>> {
@@ -215,22 +270,14 @@ fn fetch_session_agents(session: Option<&str>) -> Option<Vec<AgentInfo>> {
             agents
                 .into_iter()
                 .map(|a| {
-                    let display_name = a
-                        .name
-                        .or(a.agent)
-                        .unwrap_or_else(|| a.terminal_id.clone());
-                    let proj = a
-                        .cwd
-                        .as_deref()
-                        .map_or_else(|| "?".into(), project_name);
-                    let branch = a.cwd.as_deref().and_then(git_branch);
-                    AgentInfo {
-                        display_name,
-                        status: parse_status(&a.agent_status),
-                        project_name: proj,
-                        git_branch: branch,
-                        terminal_title_stripped: a.terminal_title_stripped,
-                    }
+                    AgentInfo::new(
+                        a.name,
+                        a.agent,
+                        &a.terminal_id,
+                        &a.agent_status,
+                        a.cwd.as_deref(),
+                        a.terminal_title_stripped,
+                    )
                 })
                 .collect(),
         ),
@@ -293,6 +340,62 @@ mod tests {
         assert!(parse_session_list("").is_empty());
     }
 
+    #[test]
+    fn agent_info_maps_all_fields() {
+        let info = AgentInfo::without_branch(
+            Some("worker".into()),
+            Some("claude-code".into()),
+            "t9",
+            "blocked",
+            Some("/home/x/proj"),
+            Some("タイトル".into()),
+        );
+        assert_eq!(info.display_name, "worker");
+        assert_eq!(info.status, AgentStatus::Blocked);
+        assert_eq!(info.project_name, "proj");
+        assert_eq!(info.git_branch, None);
+        assert_eq!(info.terminal_title_stripped.as_deref(), Some("タイトル"));
+    }
+
+    #[test]
+    fn agent_info_display_name_falls_back_to_agent_then_id() {
+        let info = AgentInfo::without_branch(None, Some("claude-code".into()), "t9", "idle", None, None);
+        assert_eq!(info.display_name, "claude-code");
+        let info = AgentInfo::without_branch(None, None, "t9", "idle", None, None);
+        assert_eq!(info.display_name, "t9");
+    }
+
+    #[test]
+    fn agent_info_treats_empty_name_as_missing() {
+        let info = AgentInfo::without_branch(Some(String::new()), Some("a".into()), "t9", "idle", None, None);
+        assert_eq!(info.display_name, "a");
+    }
+
+    #[test]
+    fn agent_info_treats_empty_agent_as_missing() {
+        let info = AgentInfo::without_branch(None, Some(String::new()), "t9", "idle", None, None);
+        assert_eq!(info.display_name, "t9");
+    }
+
+    #[test]
+    fn agent_info_without_cwd_uses_question_mark() {
+        let info = AgentInfo::without_branch(None, None, "t9", "working", None, None);
+        assert_eq!(info.project_name, "?");
+    }
+
+    #[test]
+    fn agent_info_drops_empty_title() {
+        let info = AgentInfo::without_branch(None, None, "t9", "done", None, Some(String::new()));
+        assert_eq!(info.terminal_title_stripped, None);
+        assert_eq!(info.status, AgentStatus::Done);
+    }
+
+    #[test]
+    fn agent_info_new_without_cwd_has_no_branch() {
+        let info = AgentInfo::new(None, None, "t9", "idle", None, None);
+        assert_eq!(info.git_branch, None);
+    }
+
     fn agent(status: AgentStatus, name: &str) -> AgentInfo {
         AgentInfo {
             display_name: name.to_owned(),
@@ -353,6 +456,49 @@ mod tests {
         assert_eq!(
             agent_list_args(Some("private")),
             vec!["--session", "private", "agent", "list"]
+        );
+    }
+
+    #[test]
+    fn merge_returns_none_when_both_backends_fail() {
+        assert!(merge(None, None).is_none());
+    }
+
+    #[test]
+    fn merge_uses_only_herdr_when_core_is_unavailable() {
+        let herdr = vec![agent(AgentStatus::Idle, "i"), agent(AgentStatus::Blocked, "b")];
+        let merged = merge(Some(herdr), None).unwrap();
+        assert_eq!(names(&merged), ["b", "i"]);
+    }
+
+    #[test]
+    fn merge_uses_only_core_when_herdr_is_unavailable() {
+        let core = vec![agent(AgentStatus::Working, "w")];
+        let merged = merge(None, Some(core)).unwrap();
+        assert_eq!(names(&merged), ["w"]);
+    }
+
+    #[test]
+    fn merge_keeps_empty_list_when_a_backend_succeeds_with_no_agents() {
+        assert_eq!(merge(Some(vec![]), None).unwrap().len(), 0);
+        assert_eq!(merge(None, Some(vec![])).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn merge_sorts_both_and_puts_herdr_first_within_a_status() {
+        let herdr = vec![
+            agent(AgentStatus::Working, "herdr-w"),
+            agent(AgentStatus::Blocked, "herdr-b"),
+        ];
+        let core = vec![
+            agent(AgentStatus::Working, "core-w"),
+            agent(AgentStatus::Blocked, "core-b"),
+            agent(AgentStatus::Done, "core-d"),
+        ];
+        let merged = merge(Some(herdr), Some(core)).unwrap();
+        assert_eq!(
+            names(&merged),
+            ["herdr-b", "core-b", "core-d", "herdr-w", "core-w"]
         );
     }
 }
